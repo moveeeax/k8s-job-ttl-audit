@@ -1,0 +1,18 @@
+# Built binary (anchored to repo root so it never matches cmd/k8s-job-ttl-audit/)
+/k8s-job-ttl-audit
+/kjta
+/dist/
+
+# Test / coverage artifacts
+*.out
+coverage.txt
+
+# Editor / OS cruft
+.idea/
+.vscode/
+*.swp
+.DS_Store
+
+# Always keep fixtures
+!testdata/**
+!examples/**
