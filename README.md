@@ -1,7 +1,7 @@
 # k8s-job-ttl-audit
 
 [![ci](https://github.com/moveeeax/k8s-job-ttl-audit/actions/workflows/ci.yml/badge.svg)](https://github.com/moveeeax/k8s-job-ttl-audit/actions/workflows/ci.yml)
-[![Go](https://img.shields.io/badge/go-1.22%2B-00ADD8?logo=go)](https://go.dev/)
+[![Go](https://img.shields.io/badge/go-1.26%2B-00ADD8?logo=go)](https://go.dev/)
 [![License: MIT](https://img.shields.io/badge/license-MIT-green.svg)](LICENSE)
 
 Audit Kubernetes **Jobs** for a missing or too-long `ttlSecondsAfterFinished`, so
