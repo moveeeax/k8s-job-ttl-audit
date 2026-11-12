@@ -207,3 +207,127 @@ func TestHumanDuration(t *testing.T) {
 		}
 	}
 }
+
+func cronOwned(name, owner, reason string) Job {
+	return Job{Name: name, Namespace: "batch", UID: name, Finished: true,
+		FinishedReason: reason, CompletionTime: completedAt(time.Hour),
+		OwnerKind: "CronJob", OwnerName: owner}
+}
+
+func TestCronJobHistoryLimitBoundsNoTTL(t *testing.T) {
+	jobs := []Job{
+		cronOwned("default-limits-1", "default-limits", "Complete"),
+		cronOwned("default-limits-2", "default-limits", "Failed"),
+		cronOwned("big-1", "big", "Complete"),
+		cronOwned("big-failed-1", "big", "Failed"),
+		cronOwned("gone-1", "gone", "Complete"),
+	}
+	crons := []CronJob{
+		{Name: "default-limits", Namespace: "batch"}, // API defaults 3/1
+		{Name: "big", Namespace: "batch", SuccessfulJobsHistoryLimit: ptr32(50), FailedJobsHistoryLimit: ptr32(2)},
+		// Same name in another namespace must not count as the owner.
+		{Name: "gone", Namespace: "other"},
+	}
+	rep := Classify(jobs, nil, Options{Now: refNow, CronJobs: crons, CronJobsListed: true, MaxHistory: 10})
+
+	got := map[string]Finding{}
+	for _, f := range rep.Findings {
+		got[f.Name] = f
+	}
+	if len(got) != 2 {
+		t.Fatalf("findings = %+v, want big-1 and gone-1", rep.Findings)
+	}
+	if f := got["big-1"]; f.Reason != ReasonNoTTL || f.HistoryLimit == nil || *f.HistoryLimit != 50 {
+		t.Errorf("big-1 = %+v, want no-ttl with history 50", f)
+	}
+	if f := got["gone-1"]; f.Reason != ReasonOrphanedCronJob || f.HistoryLimit != nil {
+		t.Errorf("gone-1 = %+v, want orphaned-cronjob-job without history", f)
+	}
+	// default-limits-1 (3), default-limits-2 (1) and big-failed-1 (2) are bounded.
+	if rep.BoundedByHistory != 3 {
+		t.Errorf("boundedByHistory = %d, want 3", rep.BoundedByHistory)
+	}
+	if rep.MaxHistory == nil || *rep.MaxHistory != 10 {
+		t.Errorf("maxHistory = %v, want 10", rep.MaxHistory)
+	}
+}
+
+func TestCronJobHistoryLimitAtThresholdBounded(t *testing.T) {
+	jobs := []Job{cronOwned("edge-1", "edge", "Complete")}
+	crons := []CronJob{{Name: "edge", Namespace: "batch", SuccessfulJobsHistoryLimit: ptr32(10)}}
+	rep := Classify(jobs, nil, Options{Now: refNow, CronJobs: crons, CronJobsListed: true, MaxHistory: 10})
+	if rep.StaleJobs != 0 {
+		t.Fatalf("limit == max-history flagged: %+v", rep.Findings)
+	}
+	rep = Classify(jobs, nil, Options{Now: refNow, CronJobs: crons, CronJobsListed: true, MaxHistory: 9})
+	if rep.StaleJobs != 1 || rep.Findings[0].Reason != ReasonNoTTL {
+		t.Fatalf("limit > max-history not flagged no-ttl: %+v", rep.Findings)
+	}
+}
+
+func TestCronJobsNotListedKeepsNoTTL(t *testing.T) {
+	// Without a CronJob listing a missing owner proves nothing: keep no-ttl.
+	jobs := []Job{cronOwned("n-1", "nightly", "Complete")}
+	rep := Classify(jobs, nil, Options{Now: refNow, MaxHistory: 10})
+	if rep.StaleJobs != 1 || rep.Findings[0].Reason != ReasonNoTTL {
+		t.Fatalf("want no-ttl, got %+v", rep.Findings)
+	}
+	if rep.MaxHistory != nil || rep.Findings[0].HistoryLimit != nil {
+		t.Errorf("history reported without a CronJob listing: %+v", rep)
+	}
+}
+
+func TestCronJobHistoryDoesNotHideTTLTooBig(t *testing.T) {
+	j := cronOwned("n-1", "nightly", "Complete")
+	j.TTLSeconds = ptr32(int32((48 * time.Hour).Seconds()))
+	crons := []CronJob{{Name: "nightly", Namespace: "batch"}}
+	rep := Classify([]Job{j}, nil, Options{Now: refNow, MaxTTL: 24 * time.Hour,
+		CronJobs: crons, CronJobsListed: true, MaxHistory: 10})
+	if rep.StaleJobs != 1 || rep.Findings[0].Reason != ReasonTTLTooBig {
+		t.Fatalf("want ttl-too-big, got %+v", rep.Findings)
+	}
+	if rep.BoundedByHistory != 0 {
+		t.Errorf("job with a TTL counted as bounded: %d", rep.BoundedByHistory)
+	}
+}
+
+func TestRenderTableHistoryColumn(t *testing.T) {
+	jobs := []Job{cronOwned("big-1", "big", "Complete"), cronOwned("ok-1", "ok", "Complete")}
+	crons := []CronJob{
+		{Name: "big", Namespace: "batch", SuccessfulJobsHistoryLimit: ptr32(50)},
+		{Name: "ok", Namespace: "batch"},
+	}
+	rep := Classify(jobs, nil, Options{Now: refNow, CronJobs: crons, CronJobsListed: true, MaxHistory: 10})
+	var buf bytes.Buffer
+	if err := RenderTable(&buf, rep); err != nil {
+		t.Fatal(err)
+	}
+	out := buf.String()
+	lines := strings.Split(out, "\n")
+	if !strings.HasSuffix(strings.TrimSpace(lines[0]), "HISTORY") {
+		t.Errorf("header lacks HISTORY: %q", lines[0])
+	}
+	if !strings.HasSuffix(strings.TrimSpace(lines[1]), "CronJob/big  50") {
+		t.Errorf("row lacks history limit: %q", lines[1])
+	}
+	if !strings.Contains(out, "1 bounded by CronJob history <= 10") {
+		t.Errorf("summary lacks bounded count:\n%s", out)
+	}
+}
+
+func TestRecreatedCronJobOrphansOldJobs(t *testing.T) {
+	// Same name, new UID: the controller of the new CronJob does not own,
+	// and so never cleans up, Jobs of the old one.
+	old := cronOwned("nightly-1", "nightly", "Complete")
+	old.OwnerUID = "cj-old"
+	cur := cronOwned("nightly-2", "nightly", "Complete")
+	cur.OwnerUID = "cj-new"
+	crons := []CronJob{{Name: "nightly", Namespace: "batch", UID: "cj-new"}}
+	rep := Classify([]Job{old, cur}, nil, Options{Now: refNow, CronJobs: crons, CronJobsListed: true, MaxHistory: 10})
+	if rep.StaleJobs != 1 || rep.Findings[0].Name != "nightly-1" || rep.Findings[0].Reason != ReasonOrphanedCronJob {
+		t.Fatalf("findings = %+v, want nightly-1 orphaned", rep.Findings)
+	}
+	if rep.BoundedByHistory != 1 {
+		t.Errorf("boundedByHistory = %d, want 1", rep.BoundedByHistory)
+	}
+}

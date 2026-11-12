@@ -53,9 +53,13 @@ const sampleDump = `{
 }`
 
 func TestParseInputJSON(t *testing.T) {
-	jobs, pods, err := ParseInput([]byte(sampleDump))
+	inv, err := ParseInput([]byte(sampleDump))
 	if err != nil {
 		t.Fatal(err)
+	}
+	jobs, pods := inv.Jobs, inv.Pods
+	if inv.CronJobsListed {
+		t.Error("CronJobsListed = true for a dump without CronJobs")
 	}
 	if len(jobs) != 3 {
 		t.Fatalf("jobs = %d, want 3", len(jobs))
@@ -104,17 +108,82 @@ items:
       conditions:
         - {type: Complete, status: "True"}
 `
-	jobs, _, err := ParseInput([]byte(y))
+	inv, err := ParseInput([]byte(y))
 	if err != nil {
 		t.Fatal(err)
 	}
+	jobs := inv.Jobs
 	if len(jobs) != 1 || !jobs[0].Finished {
 		t.Fatalf("yaml parse failed: %+v", jobs)
 	}
 }
 
 func TestParseInputEmpty(t *testing.T) {
-	if _, _, err := ParseInput([]byte(`{"items":[]}`)); err == nil {
+	if _, err := ParseInput([]byte(`{"items":[]}`)); err == nil {
 		t.Fatal("expected error on empty items")
+	}
+}
+
+const cronDump = `{
+  "kind": "List",
+  "items": [
+    {
+      "kind": "CronJob",
+      "metadata": {"name": "nightly", "namespace": "batch", "uid": "cj-1"},
+      "spec": {"successfulJobsHistoryLimit": 7}
+    },
+    {
+      "kind": "Job",
+      "metadata": {"name": "nightly-1", "namespace": "batch", "uid": "job-1",
+        "labels": {"team": "data"},
+        "ownerReferences": [{"kind": "CronJob", "name": "nightly", "uid": "cj-1", "controller": true}]},
+      "spec": {},
+      "status": {"conditions": [{"type": "Failed", "status": "True", "lastTransitionTime": "2026-09-01T00:00:00Z"}]}
+    },
+    {
+      "kind": "Job",
+      "metadata": {"name": "op-run", "namespace": "batch", "uid": "job-2",
+        "ownerReferences": [{"kind": "Workflow", "name": "wf", "uid": "wf-1", "controller": true}]},
+      "spec": {},
+      "status": {"conditions": [{"type": "Complete", "status": "True"}]}
+    }
+  ]
+}`
+
+func TestParseInputCronJobsAndOwners(t *testing.T) {
+	inv, err := ParseInput([]byte(cronDump))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !inv.CronJobsListed || len(inv.CronJobs) != 1 {
+		t.Fatalf("cronjobs not parsed: listed=%v %+v", inv.CronJobsListed, inv.CronJobs)
+	}
+	cj := inv.CronJobs[0]
+	if cj.Name != "nightly" || cj.Namespace != "batch" {
+		t.Errorf("cronjob identity = %s/%s", cj.Namespace, cj.Name)
+	}
+	if cj.SuccessfulJobsHistoryLimit == nil || *cj.SuccessfulJobsHistoryLimit != 7 {
+		t.Errorf("successful limit = %v, want 7", cj.SuccessfulJobsHistoryLimit)
+	}
+	if cj.FailedJobsHistoryLimit != nil {
+		t.Errorf("failed limit = %v, want nil (API default)", *cj.FailedJobsHistoryLimit)
+	}
+
+	j := inv.Jobs[0]
+	if j.Labels["team"] != "data" {
+		t.Errorf("labels = %v", j.Labels)
+	}
+	want := time.Date(2026, 9, 1, 0, 0, 0, 0, time.UTC)
+	if j.CompletionTime == nil || !j.CompletionTime.Equal(want) {
+		t.Errorf("failed job completion fallback = %v, want %v", j.CompletionTime, want)
+	}
+	if j.OwnerUID != "cj-1" || cj.UID != "cj-1" {
+		t.Errorf("owner UID = %q, cronjob UID = %q, want cj-1", j.OwnerUID, cj.UID)
+	}
+	if j.OtherOwner != "" {
+		t.Errorf("CronJob-owned job got OtherOwner %q", j.OtherOwner)
+	}
+	if got := inv.Jobs[1].OtherOwner; got != "Workflow/wf" {
+		t.Errorf("OtherOwner = %q, want Workflow/wf", got)
 	}
 }

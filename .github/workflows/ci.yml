@@ -57,3 +57,7 @@ jobs:
           echo "smoke ok: fail-on stale gated correctly"
       - name: JSON output is valid
         run: ./k8s-job-ttl-audit scan --input examples/jobs-dump.json -o json | python3 -c "import sys,json; json.load(sys.stdin)"
+      - name: Reap dry run plans from the fixture
+        run: |
+          ./k8s-job-ttl-audit reap --input examples/jobs-dump.json --older-than 168h --keep-last 0
+          ./k8s-job-ttl-audit reap --input examples/jobs-dump.json -o json | python3 -c "import sys,json; json.load(sys.stdin)"
