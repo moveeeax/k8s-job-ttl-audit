@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/spf13/cobra"
+	"github.com/spf13/pflag"
 
 	"github.com/moveeeax/k8s-job-ttl-audit/internal/audit"
 	"github.com/moveeeax/k8s-job-ttl-audit/internal/cluster"
@@ -32,19 +33,56 @@ func newRootCmd() *cobra.Command {
 		SilenceErrors: true,
 		Version:       version,
 	}
-	root.AddCommand(newScanCmd())
+	root.AddCommand(newScanCmd(), newReapCmd())
 	return root
 }
 
-type scanFlags struct {
+// sourceFlags select where Jobs come from: a live cluster or an --input dump.
+type sourceFlags struct {
 	kubeconfig    string
 	kubecontext   string
 	namespace     string
 	allNamespaces bool
-	maxTTL        time.Duration
-	output        string
 	input         string
-	failOn        string
+}
+
+func (s *sourceFlags) register(fl *pflag.FlagSet) {
+	fl.StringVar(&s.kubeconfig, "kubeconfig", "", "path to kubeconfig (default: $KUBECONFIG or ~/.kube/config)")
+	fl.StringVar(&s.kubecontext, "context", "", "kubeconfig context to use (default: current)")
+	fl.StringVarP(&s.namespace, "namespace", "n", "", "namespace to scan (default: current context namespace)")
+	fl.BoolVarP(&s.allNamespaces, "all-namespaces", "A", false, "scan all namespaces")
+	fl.StringVar(&s.input, "input", "", "read Jobs, Pods and CronJobs from a JSON/YAML dump instead of a live cluster (offline)")
+}
+
+// load reads the inventory from --input or the cluster. client is nil in
+// offline mode.
+func (s *sourceFlags) load(ctx context.Context) (audit.Inventory, *cluster.Client, error) {
+	if s.input != "" {
+		data, err := os.ReadFile(s.input)
+		if err != nil {
+			return audit.Inventory{}, nil, fmt.Errorf("read --input: %w", err)
+		}
+		inv, err := audit.ParseInput(data)
+		return inv, nil, err
+	}
+	ns := s.namespace
+	if s.allNamespaces {
+		ns = ""
+	}
+	c, err := cluster.New(s.kubeconfig, s.kubecontext)
+	if err != nil {
+		return audit.Inventory{}, nil, err
+	}
+	inv, err := c.Fetch(ctx, ns)
+	return inv, c, err
+}
+
+type scanFlags struct {
+	sourceFlags
+	maxTTL     time.Duration
+	maxHistory int
+	output     string
+	failOn     string
 }
 
 func newScanCmd() *cobra.Command {
@@ -57,13 +95,10 @@ func newScanCmd() *cobra.Command {
 		},
 	}
 	fl := cmd.Flags()
-	fl.StringVar(&f.kubeconfig, "kubeconfig", "", "path to kubeconfig (default: $KUBECONFIG or ~/.kube/config)")
-	fl.StringVar(&f.kubecontext, "context", "", "kubeconfig context to use (default: current)")
-	fl.StringVarP(&f.namespace, "namespace", "n", "", "namespace to scan (default: current context namespace)")
-	fl.BoolVarP(&f.allNamespaces, "all-namespaces", "A", false, "scan all namespaces")
+	f.register(fl)
 	fl.DurationVar(&f.maxTTL, "max-ttl", 0, "flag finished Jobs whose TTL exceeds this (e.g. 24h); 0 flags only missing TTL")
+	fl.IntVar(&f.maxHistory, "max-history", 10, "do not flag a TTL-less CronJob Job when the CronJob history limit for its state is at most this")
 	fl.StringVarP(&f.output, "output", "o", "table", "output format: table | json")
-	fl.StringVar(&f.input, "input", "", "read Jobs+Pods from a JSON/YAML dump instead of a live cluster (offline)")
 	fl.StringVar(&f.failOn, "fail-on", "", "exit non-zero when findings exist: stale")
 	return cmd
 }
@@ -75,37 +110,22 @@ func runScan(ctx context.Context, f *scanFlags) error {
 	if f.failOn != "" && f.failOn != "stale" {
 		return fmt.Errorf("invalid --fail-on %q: want stale", f.failOn)
 	}
-
-	var jobs []audit.Job
-	var pods []audit.Pod
-
-	if f.input != "" {
-		data, err := os.ReadFile(f.input)
-		if err != nil {
-			return fmt.Errorf("read --input: %w", err)
-		}
-		jobs, pods, err = audit.ParseInput(data)
-		if err != nil {
-			return err
-		}
-	} else {
-		ns := f.namespace
-		if f.allNamespaces {
-			ns = ""
-		}
-		c, err := cluster.New(f.kubeconfig, f.kubecontext)
-		if err != nil {
-			return err
-		}
-		jobs, pods, err = c.Fetch(ctx, ns)
-		if err != nil {
-			return err
-		}
+	if f.maxHistory < 0 {
+		return fmt.Errorf("invalid --max-history %d: must be >= 0", f.maxHistory)
 	}
 
-	rep := audit.Classify(jobs, pods, audit.Options{MaxTTL: f.maxTTL})
+	inv, _, err := f.load(ctx)
+	if err != nil {
+		return err
+	}
 
-	var err error
+	rep := audit.Classify(inv.Jobs, inv.Pods, audit.Options{
+		MaxTTL:         f.maxTTL,
+		CronJobs:       inv.CronJobs,
+		CronJobsListed: inv.CronJobsListed,
+		MaxHistory:     f.maxHistory,
+	})
+
 	if f.output == "json" {
 		err = audit.RenderJSON(os.Stdout, rep)
 	} else {

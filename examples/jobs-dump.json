@@ -4,6 +4,48 @@
   "items": [
     {
       "apiVersion": "batch/v1",
+      "kind": "CronJob",
+      "metadata": { "name": "nightly-backup", "namespace": "batch", "uid": "cj-backup" },
+      "spec": { "schedule": "0 2 * * *", "successfulJobsHistoryLimit": 3, "failedJobsHistoryLimit": 1 }
+    },
+    {
+      "apiVersion": "batch/v1",
+      "kind": "CronJob",
+      "metadata": { "name": "hourly-sync", "namespace": "batch", "uid": "cj-sync" },
+      "spec": { "schedule": "0 * * * *", "successfulJobsHistoryLimit": 100, "failedJobsHistoryLimit": 1 }
+    },
+    {
+      "apiVersion": "batch/v1",
+      "kind": "Job",
+      "metadata": {
+        "name": "hourly-sync-29299",
+        "namespace": "batch",
+        "uid": "5555-eeee",
+        "ownerReferences": [{ "kind": "CronJob", "name": "hourly-sync", "uid": "cj-sync", "controller": true }]
+      },
+      "spec": {},
+      "status": {
+        "completionTime": "2026-09-10T10:00:40Z",
+        "conditions": [{ "type": "Complete", "status": "True" }]
+      }
+    },
+    {
+      "apiVersion": "batch/v1",
+      "kind": "Job",
+      "metadata": {
+        "name": "weekly-report-27990",
+        "namespace": "app",
+        "uid": "6666-ffff",
+        "ownerReferences": [{ "kind": "CronJob", "name": "weekly-report", "uid": "cj-gone", "controller": true }]
+      },
+      "spec": {},
+      "status": {
+        "completionTime": "2026-07-26T06:00:00Z",
+        "conditions": [{ "type": "Complete", "status": "True" }]
+      }
+    },
+    {
+      "apiVersion": "batch/v1",
       "kind": "Job",
       "metadata": {
         "name": "nightly-backup-28401",
